@@ -111,7 +111,14 @@ def setup_distributed(info: RankInfo, timeout_min: int = 30) -> torch.device:
         # Rendezvous address is derived from the allocation, not read from the
         # environment, for the same reason as the rank variables: a single
         # pre-registered MASTER_ADDR would point every rank at its own node.
-        master = _first_hostname(os.environ.get("SLURM_JOB_NODELIST", "")) or "127.0.0.1"
+        nodelist = os.environ.get("SLURM_JOB_NODELIST", "")
+        master = _first_hostname(nodelist) or "127.0.0.1"
+        # Printed because a mis-parsed nodelist does not raise: every rank just
+        # retries a hostname that resolves to nothing until the timeout.
+        print(
+            f"RENDEZVOUS nodelist={nodelist!r} master={master}:{RENDEZVOUS_PORT}",
+            flush=True,
+        )
         dist.init_process_group(
             backend,
             init_method=f"tcp://{master}:{RENDEZVOUS_PORT}",
@@ -123,9 +130,17 @@ def setup_distributed(info: RankInfo, timeout_min: int = 30) -> torch.device:
 
 
 def _first_hostname(nodelist: str) -> str | None:
-    """Expand the first host out of a Slurm nodelist such as `c[264-267]`."""
+    """Expand the first host out of a Slurm nodelist such as `c[264-267]`.
+
+    `scontrol` is the authoritative expander but is usually absent from a job
+    container, so the bracket form has to be parsed here. Truncating at the
+    bracket is not good enough: `c[264-267]` would yield the host `c`, which
+    resolves to nothing and leaves every rank retrying the rendezvous forever.
+    """
     if not nodelist:
         return None
+
+    import re
     import subprocess
 
     try:
@@ -135,9 +150,22 @@ def _first_hostname(nodelist: str) -> str | None:
             text=True,
             check=True,
         ).stdout
-        return out.split("\n")[0].strip() or None
-    except Exception:  # noqa: BLE001 - fall back to the literal string
-        return nodelist.split(",")[0].split("[")[0] or None
+        first = out.split("\n")[0].strip()
+        if first:
+            return first
+    except Exception:  # noqa: BLE001 - scontrol is not in the job image
+        pass
+
+    # "c[391-394,400]" -> prefix "c", range body "391-394,400" -> "c391".
+    # "c391,c392"      -> no bracket, so the first token is already a host.
+    match = re.match(r"^([^,\[]+)(?:\[([^\]]+)\])?", nodelist.strip())
+    if not match:
+        return None
+    prefix, body = match.group(1), match.group(2)
+    if not body:
+        return prefix or None
+    first_index = re.split(r"[,\-]", body)[0].strip()
+    return f"{prefix}{first_index}" or None
 
 
 def report_placement(info: RankInfo, device: torch.device) -> list[dict[str, Any]]:
