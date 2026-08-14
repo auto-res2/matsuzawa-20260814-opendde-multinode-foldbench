@@ -130,7 +130,7 @@ def configure_nccl(info: RankInfo) -> None:
         os.environ.setdefault("NCCL_DEBUG_SUBSYS", "INIT,NET")
 
 
-def setup_distributed(info: RankInfo, timeout_min: int = 10) -> torch.device:
+def setup_distributed(info: RankInfo, timeout_min: int = 20) -> torch.device:
     """Initialize NCCL and pin this rank to its GPU."""
     if torch.cuda.is_available():
         torch.cuda.set_device(info.local_rank)
@@ -520,9 +520,18 @@ def run(args: argparse.Namespace) -> int:
 
     optimizer = torch.optim.AdamW(trainable, lr=args.lr, weight_decay=0.0)
 
-    # Each rank takes a disjoint stride of the examples, so the ranks genuinely
-    # do different work rather than recomputing the same batch in lockstep.
-    shard = examples[info.rank :: info.world_size]
+    # Each rank takes a strided slice, so the ranks genuinely do different work
+    # rather than recomputing the same batch in lockstep. Every rank must run
+    # the SAME NUMBER of steps: each step issues DDP's gradient all-reduce, so a
+    # rank that finishes early moves on to the loss all_reduce while the others
+    # are still reducing gradients, the two collectives mismatch, and the job
+    # hangs to the timeout. 27 examples over 16 ranks gives eleven ranks two and
+    # five ranks one, which is exactly enough to trigger it.
+    per_rank = -(-len(examples) // info.world_size)  # ceil
+    shard = [
+        examples[(info.rank + k * info.world_size) % len(examples)]
+        for k in range(per_rank)
+    ]
     if info.is_main:
         # Node count comes from the hostnames the ranks reported, not from
         # world_size/local_world_size: SLURM_NTASKS_PER_NODE is not always set,
@@ -534,12 +543,14 @@ def run(args: argparse.Namespace) -> int:
             len({r["host"] for r in placement}),
             len(shard),
         )
-        if len(examples) < info.world_size:
-            logger.warning(
-                "fewer examples (%d) than ranks (%d): %d ranks will train on nothing",
-                len(examples),
+        padded = per_rank * info.world_size - len(examples)
+        if padded:
+            logger.info(
+                "padded the schedule with %d repeated examples so all %d ranks "
+                "run %d steps per epoch",
+                padded,
                 info.world_size,
-                info.world_size - len(examples),
+                per_rank,
             )
 
     losses: list[float] = []
