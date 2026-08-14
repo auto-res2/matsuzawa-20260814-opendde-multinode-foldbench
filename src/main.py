@@ -34,8 +34,13 @@ except ModuleNotFoundError:  # pragma: no cover - only on a non-uv entrypoint
 from omegaconf import DictConfig, OmegaConf
 
 # Scale per mode. Only the amount of work changes: same data, same model.
+# `expect_nodes: 0` disables the multi-node check for sanity, which exists to
+# prove the code runs at all and is deliberately given a single node.
 MODE_OVERRIDES = {
-    "sanity": {"n_entries": 1, "epochs": 2, "n_cycle": 1, "n_sample": 1, "min_steps": 2},
+    "sanity": {
+        "n_entries": 1, "epochs": 2, "n_cycle": 1, "n_sample": 1,
+        "min_steps": 2, "expect_nodes": 0,
+    },
     "pilot": {"n_entries": 8, "epochs": 1, "n_cycle": 4, "n_sample": 2, "min_steps": 5},
     "full": {"n_entries": 30, "epochs": 3, "n_cycle": 4, "n_sample": 4, "min_steps": 5},
 }
@@ -78,7 +83,7 @@ def main(cfg: DictConfig) -> None:
         "--n-sample", str(overrides["n_sample"]),
         "--min-steps", str(overrides["min_steps"]),
         "--lr", str(cfg.run.lr),
-        "--expect-nodes", str(cfg.run.expect_nodes),
+        "--expect-nodes", str(overrides.get("expect_nodes", cfg.run.expect_nodes)),
         "--verdict-prefix", VERDICT_PREFIX[mode],
     ]
 
