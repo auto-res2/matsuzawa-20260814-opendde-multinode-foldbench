@@ -110,7 +110,14 @@ def configure_nccl(info: RankInfo) -> None:
     Loopback and container-local interfaces are excluded rather than a specific
     one named, so this stays correct if the node's interface names differ.
     """
-    os.environ.setdefault("NCCL_SOCKET_IFNAME", "^lo,docker,veth,virbr")
+    # A single named interface rather than an exclusion list. Excluding
+    # loopback still left NCCL five candidates (one Ethernet plus four IPoIB
+    # rails); that was enough for a 2-node job, whose single peer pair only has
+    # to agree once, but a 4-node job has six pairs and hung in the first
+    # collective with every rank spinning at 100% CPU. All four allocated nodes
+    # carry enP5p9s0 on one flat 10.134.128.0/21 subnet, so it is the choice
+    # that cannot depend on which pair of nodes the scheduler hands out.
+    os.environ.setdefault("NCCL_SOCKET_IFNAME", "enP5p9s0")
     # Interface selection is printed once, by one rank, so a wrong choice is
     # visible in the log instead of having to be inferred from a socket error.
     if info.rank == 0:
@@ -118,7 +125,7 @@ def configure_nccl(info: RankInfo) -> None:
         os.environ.setdefault("NCCL_DEBUG_SUBSYS", "INIT,NET")
 
 
-def setup_distributed(info: RankInfo, timeout_min: int = 30) -> torch.device:
+def setup_distributed(info: RankInfo, timeout_min: int = 10) -> torch.device:
     """Initialize NCCL and pin this rank to its GPU."""
     if torch.cuda.is_available():
         torch.cuda.set_device(info.local_rank)
