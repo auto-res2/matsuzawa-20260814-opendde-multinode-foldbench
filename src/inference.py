@@ -116,7 +116,7 @@ def run(args: argparse.Namespace) -> int:
         return 1
     logger.info("%d targets from %s", len(targets), args.target_type)
 
-    model, configs = build_runner(
+    model, _ = build_runner(
         args.checkpoint, device, args.n_step, args.n_sample, args.seed
     )
 
@@ -131,7 +131,7 @@ def run(args: argparse.Namespace) -> int:
             sample = cif_to_input_json(str(gt_cif), sample_name=pdb_id)
             sample = sample[0] if isinstance(sample, list) else sample
             out_path = prediction_dir / f"{pdb_id}.cif"
-            ranking = predict_one(model, configs, sample, out_path, device)
+            ranking = predict_one(model, sample, out_path, device, args.seed)
             fix_cif_for_evaluators(out_path)
             rows.append(
                 {
@@ -166,36 +166,54 @@ def run(args: argparse.Namespace) -> int:
     return 0 if rows else 1
 
 
-def predict_one(model, configs, sample: dict, out_path: Path, device: str) -> float:
-    """Run the sampler on one target and dump the top-ranked pose."""
-    from opendde.data.inference.infer_dataloader import InferenceDataset
+def predict_one(model, sample: dict, out_path: Path, device: str, seed: int) -> float:
+    """Run the sampler on one target and place the top-ranked pose at out_path."""
+    import shutil
+    import tempfile
+
+    from opendde.data.inference.json_to_feature import SampleDictToFeatures
+    from opendde.data.utils import data_type_transform, make_dummy_feature
     from runner.dumper import DataDumper
 
-    dataset = InferenceDataset(
-        input_json_path=None,
-        configs=configs,
-        samples=[sample],
+    sample2feat = SampleDictToFeatures(sample)
+    features, atom_array, _ = sample2feat.get_feature_dict()
+    features["distogram_rep_atom_mask"] = torch.Tensor(
+        atom_array.distogram_rep_atom_mask
+    ).long()
+    features = make_dummy_feature(
+        features_dict=features, dummy_feats=["template", "msa"]
     )
-    data, atom_array, _ = dataset[0]
+    feat = data_type_transform(feat_or_label_dict=features)
     feat = {
-        k: (v.to(device) if isinstance(v, torch.Tensor) else v)
-        for k, v in data["input_feature_dict"].items()
+        k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in feat.items()
     }
+
     with torch.no_grad():
         pred, _, _ = model(feat, mode="inference")
 
-    dumper = DataDumper(base_dir=str(out_path.parent))
-    dumper.dump(
-        dataset_name="",
-        pdb_id=out_path.stem,
-        seed=configs.seeds[0],
-        pred_dict=pred,
-        atom_array=atom_array,
-        entity_poly_type={},
-    )
+    # The dumper writes to
+    # {base}/{group}/{pdb_id}/seed_{seed}/predictions/{pdb_id}_sample_{rank}.cif,
+    # so dump into a scratch tree and lift out the best-ranked pose.
+    with tempfile.TemporaryDirectory() as tmp:
+        DataDumper(base_dir=tmp).dump(
+            group_name="",
+            pdb_id=out_path.stem,
+            seed=seed,
+            pred_dict=pred,
+            atom_array=atom_array,
+            entity_poly_type=sample2feat.entity_poly_type,
+        )
+        produced = sorted(Path(tmp).rglob("*_sample_*.cif"))
+        if not produced:
+            raise RuntimeError(f"dumper produced no mmCIF for {out_path.stem}")
+        # sorted_by_ranking_score=True means sample_0 is the top-ranked pose.
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(produced[0], out_path)
+
     summary = pred.get("summary_confidence")
     if isinstance(summary, dict) and "ranking_score" in summary:
-        return float(summary["ranking_score"])
+        score = summary["ranking_score"]
+        return float(score[0] if hasattr(score, "__len__") else score)
     return 1.0
 
 
