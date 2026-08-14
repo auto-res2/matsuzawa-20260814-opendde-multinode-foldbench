@@ -52,18 +52,25 @@ ALPHA_NUCLEOTIDE = 5.0
 class RankInfo:
     """Rank coordinates, discovered from whichever launcher started us.
 
-    torchrun exports RANK/WORLD_SIZE/LOCAL_RANK; a bare Slurm step exports only
-    the SLURM_* equivalents. Supporting both means the same entrypoint works
-    under `torchrun`, under `srun`, and under an external orchestrator that sets
-    one process per GPU.
+    A Slurm step exports SLURM_PROCID/SLURM_NTASKS/SLURM_LOCALID; torchrun
+    exports RANK/WORLD_SIZE/LOCAL_RANK. Both are supported, but **Slurm wins**.
+
+    That precedence is deliberate. This job is submitted through an
+    orchestrator that requires RANK and WORLD_SIZE to be pre-registered as
+    environment variables, which means every process can be handed the same
+    static RANK=0/WORLD_SIZE=1. Trusting those would collapse a 16-rank job
+    into 16 processes that each believe they are alone -- exactly the failure
+    this experiment exists to detect, and invisible in the scheduler. The
+    per-step Slurm variables are assigned by the launcher and cannot collide
+    that way, so they are consulted first.
     """
 
     def __init__(self) -> None:
-        self.rank = int(_first_env("RANK", "SLURM_PROCID", default="0"))
-        self.world_size = int(_first_env("WORLD_SIZE", "SLURM_NTASKS", default="1"))
-        self.local_rank = int(_first_env("LOCAL_RANK", "SLURM_LOCALID", default="0"))
+        self.rank = int(_first_env("SLURM_PROCID", "RANK", default="0"))
+        self.world_size = int(_first_env("SLURM_NTASKS", "WORLD_SIZE", default="1"))
+        self.local_rank = int(_first_env("SLURM_LOCALID", "LOCAL_RANK", default="0"))
         self.local_world_size = int(
-            _first_env("LOCAL_WORLD_SIZE", "SLURM_NTASKS_PER_NODE", default="1")
+            _first_env("SLURM_NTASKS_PER_NODE", "LOCAL_WORLD_SIZE", default="1")
         )
         self.host = socket.gethostname()
         self.num_nodes = max(1, self.world_size // max(1, self.local_world_size))
@@ -97,10 +104,15 @@ def setup_distributed(info: RankInfo, timeout_min: int = 30) -> torch.device:
         backend = "gloo"
 
     if info.distributed and not dist.is_initialized():
-        # MASTER_ADDR/PORT may come from torchrun; derive them from Slurm if not.
-        if "MASTER_ADDR" not in os.environ:
-            nodelist = os.environ.get("SLURM_JOB_NODELIST", "")
-            os.environ["MASTER_ADDR"] = _first_hostname(nodelist) or "127.0.0.1"
+        # Same reasoning as the rank variables: a pre-registered MASTER_ADDR
+        # would point every rank at its own node. Under Slurm the first host of
+        # the allocation is authoritative, so it overwrites whatever was set.
+        nodelist = os.environ.get("SLURM_JOB_NODELIST", "")
+        master = _first_hostname(nodelist)
+        if master:
+            os.environ["MASTER_ADDR"] = master
+        else:
+            os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
         os.environ.setdefault("MASTER_PORT", "29500")
         dist.init_process_group(
             backend,
