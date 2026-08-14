@@ -14,11 +14,23 @@ mounts; `python_bin` points at the interpreter that can see them.
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 
-import hydra
+try:
+    import hydra
+except ModuleNotFoundError:  # pragma: no cover - only on a non-uv entrypoint
+    # The generated execution image's CMD invokes `python -m src.main` directly,
+    # without `uv run`, so the project virtualenv is not on the path and the
+    # first import dies. Re-exec through uv once; the guard stops a loop if uv
+    # itself cannot supply the dependency.
+    if os.environ.get("SRC_MAIN_BOOTSTRAPPED") or shutil.which("uv") is None:
+        raise
+    os.environ["SRC_MAIN_BOOTSTRAPPED"] = "1"
+    os.execvp("uv", ["uv", "run", "python", "-u", "-m", "src.main", *sys.argv[1:]])
+
 from omegaconf import DictConfig, OmegaConf
 
 # Scale per mode. Only the amount of work changes: same data, same model.
