@@ -47,6 +47,11 @@ ALPHA_NUCLEOTIDE = 5.0
 # job can be holding this port on the allocation.
 RENDEZVOUS_PORT = 29500
 
+# Set at import, before any CUDA context exists: PyTorch reads this when the
+# context is created, and structure sizes vary enough between steps that the
+# allocator would otherwise fragment into an OOM the byte counts do not explain.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 
 # --------------------------------------------------------------------------- #
 # distributed setup
@@ -388,6 +393,27 @@ def to_device(feat: dict[str, Any], device: torch.device) -> dict[str, Any]:
     }
 
 
+def _within_atom_budget(paths: list[Path], max_atoms: int) -> list[Path]:
+    """Drop complexes too large to featurize inside one GPU's memory.
+
+    The structural-token refiner builds pair tensors that grow with the square
+    of the token count, so the biggest entries in the set asked for a single
+    144 GiB allocation on a 184 GiB card. Excluding them by size is honest and
+    reproducible; the alternative is a run whose success depends on which
+    examples a rank's shard happened to receive.
+    """
+    kept, dropped = [], []
+    for path in paths:
+        n_atom = int(torch.load(path, map_location="cpu", weights_only=False)["n_atom"])
+        (kept if n_atom <= max_atoms else dropped).append((path, n_atom))
+    if dropped:
+        logger.info(
+            "excluded %d/%d examples over %d atoms (largest %d)",
+            len(dropped), len(paths), max_atoms, max(n for _, n in dropped),
+        )
+    return [p for p, _ in kept]
+
+
 def load_examples(cache_dir: str) -> list[Path]:
     return sorted(Path(cache_dir).glob("*.pt"))
 
@@ -404,6 +430,7 @@ def train_step(
     device: torch.device,
     n_cycle: int,
     n_sample: int,
+    chunk_size: int | None,
 ) -> torch.Tensor:
     """One optimizer-free forward/backward-ready step, returning the loss."""
     from opendde.model.opendde import update_input_feature_dict
@@ -418,10 +445,10 @@ def train_step(
 
     # Trunk: frozen by construction inside get_pairformer_output.
     s_inputs, s, z = model.get_pairformer_output(
-        feat, N_cycle=n_cycle, inplace_safe=False, chunk_size=None
+        feat, N_cycle=n_cycle, inplace_safe=False, chunk_size=chunk_size
     )
     feat, s_inputs, s, z = model.expand_to_structural_tokens(
-        feat, s_inputs, s, z, inplace_safe=False, chunk_size=None
+        feat, s_inputs, s, z, inplace_safe=False, chunk_size=chunk_size
     )
 
     coord = example["coordinate"].to(device)
@@ -442,7 +469,7 @@ def train_step(
         p_lm=None,
         c_l=None,
         inplace_safe=False,
-        chunk_size=None,
+        chunk_size=chunk_size,
     )
     return diffusion_loss(
         x_denoised, x_gt, sigma, mask, atom_type_weights(feat, device)
@@ -463,6 +490,8 @@ def run(args: argparse.Namespace) -> int:
         print(f"PLACEMENT_SUMMARY {json.dumps(summary, sort_keys=True)}", flush=True)
 
     examples = load_examples(args.cache_dir)
+    if args.max_atoms > 0:
+        examples = _within_atom_budget(examples, args.max_atoms)
     if not examples:
         print(f"{args.verdict_prefix}: FAIL reason=no_cached_examples", flush=True)
         return 1
@@ -521,7 +550,8 @@ def run(args: argparse.Namespace) -> int:
             example = torch.load(path, map_location="cpu", weights_only=False)
             optimizer.zero_grad(set_to_none=True)
             loss = train_step(
-                model, diffusion, example, device, args.n_cycle, args.n_sample
+                model, diffusion, example, device,
+                args.n_cycle, args.n_sample, args.chunk_size,
             )
             loss.backward()
             grad_norm = torch.nn.utils.clip_grad_norm_(trainable, args.grad_clip)
@@ -645,6 +675,8 @@ def main() -> None:
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--n-cycle", type=int, default=4)
     parser.add_argument("--n-sample", type=int, default=4)
+    parser.add_argument("--chunk-size", type=int, default=256)
+    parser.add_argument("--max-atoms", type=int, default=4000)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--grad-clip", type=float, default=10.0)
     parser.add_argument("--min-steps", type=int, default=5)
