@@ -97,6 +97,27 @@ def _first_env(*names: str, default: str) -> str:
     return default
 
 
+def configure_nccl(info: RankInfo) -> None:
+    """Constrain NCCL's socket transport before the first collective.
+
+    Inside the job container NCCL enumerates every interface it can see and can
+    settle on one that peers cannot reach, which surfaces as
+    `socketPollConnect poll() returned 1, no POLLOUT events` on the first
+    collective rather than at rendezvous -- the c10d store uses a plain TCP
+    connection to the master and comes up fine either way, so process group
+    creation succeeds and the failure only appears once real data moves.
+
+    Loopback and container-local interfaces are excluded rather than a specific
+    one named, so this stays correct if the node's interface names differ.
+    """
+    os.environ.setdefault("NCCL_SOCKET_IFNAME", "^lo,docker,veth,virbr")
+    # Interface selection is printed once, by one rank, so a wrong choice is
+    # visible in the log instead of having to be inferred from a socket error.
+    if info.rank == 0:
+        os.environ.setdefault("NCCL_DEBUG", "INFO")
+        os.environ.setdefault("NCCL_DEBUG_SUBSYS", "INIT,NET")
+
+
 def setup_distributed(info: RankInfo, timeout_min: int = 30) -> torch.device:
     """Initialize NCCL and pin this rank to its GPU."""
     if torch.cuda.is_available():
@@ -108,6 +129,7 @@ def setup_distributed(info: RankInfo, timeout_min: int = 30) -> torch.device:
         backend = "gloo"
 
     if info.distributed and not dist.is_initialized():
+        configure_nccl(info)
         # Rendezvous address is derived from the allocation, not read from the
         # environment, for the same reason as the rank variables: a single
         # pre-registered MASTER_ADDR would point every rank at its own node.
