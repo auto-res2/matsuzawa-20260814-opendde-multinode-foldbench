@@ -488,13 +488,23 @@ def run(args: argparse.Namespace) -> int:
     # do different work rather than recomputing the same batch in lockstep.
     shard = examples[info.rank :: info.world_size]
     if info.is_main:
+        # Node count comes from the hostnames the ranks reported, not from
+        # world_size/local_world_size: SLURM_NTASKS_PER_NODE is not always set,
+        # and when it is missing that arithmetic reports one node per rank.
         logger.info(
-            "%d examples over %d ranks (%d nodes); this rank holds %d",
+            "%d examples over %d ranks on %d nodes; this rank holds %d",
             len(examples),
             info.world_size,
-            info.num_nodes,
+            len({r["host"] for r in placement}),
             len(shard),
         )
+        if len(examples) < info.world_size:
+            logger.warning(
+                "fewer examples (%d) than ranks (%d): %d ranks will train on nothing",
+                len(examples),
+                info.world_size,
+                info.world_size - len(examples),
+            )
 
     losses: list[float] = []
     step = 0
@@ -540,24 +550,38 @@ def run(args: argparse.Namespace) -> int:
 def _reduce_stats(
     losses: list[float], info: RankInfo, device: torch.device
 ) -> dict[str, float]:
-    if not losses:
-        return {"steps": 0, "loss_start": float("nan"), "loss_end": float("nan")}
+    """Average the loss across ranks so the verdict covers the whole job.
+
+    Every rank must reach the all_reduce, including ranks whose shard was
+    empty. Returning early for them would leave the ranks that do have losses
+    blocked in a collective nobody else joins -- a deadlock that only appears
+    when the example count is smaller than the rank count, and that surfaces as
+    a silent hang rather than an error.
+    """
+    contributed = 1.0 if losses else 0.0
     half = max(1, len(losses) // 4)
     local = torch.tensor(
         [
             float(len(losses)),
-            sum(losses[:half]) / half,
-            sum(losses[-half:]) / half,
+            sum(losses[:half]) / half if losses else 0.0,
+            sum(losses[-half:]) / half if losses else 0.0,
+            contributed,
         ],
         device=device,
     )
     if info.distributed:
         dist.all_reduce(local, op=dist.ReduceOp.SUM)
-        local[1:] /= info.world_size
+
+    # Divide by the ranks that actually trained, not the world size, or an
+    # empty shard would drag the reported loss toward zero.
+    n_contributing = max(local[3].item(), 1.0)
+    steps = int(local[0].item())
+    if steps == 0:
+        return {"steps": 0, "loss_start": float("nan"), "loss_end": float("nan")}
     return {
-        "steps": int(local[0].item()),
-        "loss_start": round(local[1].item(), 4),
-        "loss_end": round(local[2].item(), 4),
+        "steps": steps,
+        "loss_start": round(local[1].item() / n_contributing, 4),
+        "loss_end": round(local[2].item() / n_contributing, 4),
     }
 
 
