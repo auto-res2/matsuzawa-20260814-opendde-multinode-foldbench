@@ -36,6 +36,16 @@ def load_targets(targets_dir: str, target_type: str, limit: int) -> list[str]:
     return ids[:limit] if limit > 0 else ids
 
 
+def count_atoms(cif_path: Path) -> int:
+    """Atom-record count of a ground-truth mmCIF, read without parsing it."""
+    n = 0
+    with cif_path.open() as fh:
+        for line in fh:
+            if line.startswith(("ATOM ", "HETATM")):
+                n += 1
+    return n
+
+
 def build_runner(checkpoint: str, device: str, n_step: int, n_sample: int, seed: int):
     """Instantiate OpenDDE for sampling from a (possibly fine-tuned) checkpoint."""
     from opendde.config.inference import build_inference_config
@@ -127,6 +137,16 @@ def run(args: argparse.Namespace) -> int:
         if not gt_cif.exists():
             failures.append((pdb_id, "missing ground-truth cif"))
             continue
+        # Pair tensors grow with the square of the token count, and the sampler
+        # walks them once per diffusion step. 8xnh-assembly1 (15,706 atoms) sat
+        # for 26 minutes on one target without finishing, so oversized targets
+        # are skipped rather than allowed to consume the whole time budget.
+        if args.max_atoms > 0:
+            n_atom = count_atoms(gt_cif)
+            if n_atom > args.max_atoms:
+                failures.append((pdb_id, f"{n_atom} atoms exceeds --max-atoms"))
+                logger.info("%s: skipped, %d atoms", pdb_id, n_atom)
+                continue
         try:
             sample = cif_to_input_json(str(gt_cif), sample_name=pdb_id)
             sample = sample[0] if isinstance(sample, list) else sample
@@ -226,6 +246,7 @@ def main() -> None:
     parser.add_argument("--evaluation-dir", required=True)
     parser.add_argument("--target-type", default="interface_antibody_antigen")
     parser.add_argument("--limit", type=int, default=20)
+    parser.add_argument("--max-atoms", type=int, default=8000)
     parser.add_argument("--n-step", type=int, default=20)
     parser.add_argument("--n-sample", type=int, default=1)
     parser.add_argument("--seed", type=int, default=42)

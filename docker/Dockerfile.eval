@@ -54,7 +54,7 @@ for pair in 'baseline-pretrained /data1/rkp00041/rku00122/opendde-multinode/open
     --prediction-dir $R/$RID/prediction \
     --evaluation-dir $R/$RID/evaluation \
     --target-type interface_antibody_antigen \
-    --limit 10 --n-step 20 --n-sample 1 --device cuda; \
+    --limit 16 --max-atoms 8000 --n-step 20 --n-sample 1 --device cuda; \
 done; \
 echo '=== evaluate ==='; \
 /data1/rkp00041/rku00122/opendde-multinode/opendde-src/.venv/bin/python -u -m src.evaluate \
